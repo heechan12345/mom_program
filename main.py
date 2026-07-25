@@ -247,9 +247,6 @@ def parse_xml_file(path: str, target_year: int, target_month: int):
             record = dict(fields)
             record['날짜'] = date_val
             record['확인필요'] = ''
-            record['출처파일'] = source
-            record['원문'] = block.strip()
-            record['정렬시각'] = epoch_dt.replace(tzinfo=None)
             records.append(record)
 
     return records, unrecognized
@@ -259,7 +256,8 @@ def parse_xml_file(path: str, target_year: int, target_month: int):
 # 엑셀 저장
 # ----------------------------------------------------------------------
 
-HEADERS = ['은행', '날짜', '시간', '구분', '금액', '적요', '잔액', '계좌', '확인필요', '출처파일', '원문', '정렬시각']
+HEADERS = ['은행', '날짜', '시간', '구분', '금액', '적요', '잔액', '계좌', '확인필요']
+AMOUNT_COL_IDX = [HEADERS.index('금액') + 1, HEADERS.index('잔액') + 1]
 UNRECOG_HEADERS = ['은행', '사유', '출처파일', '원문']
 
 
@@ -274,11 +272,9 @@ def row_key(row: dict):
 
 
 def sort_key(row: dict):
-    """정렬 기준 시각. 문자 원문의 '시:분'은 같은 분에 여러 건이 몰리면 순서를
-    구분 못하므로, 문자를 받은 정확한 시각(정렬시각)이 있으면 그걸 우선 쓴다."""
-    precise = row.get('정렬시각')
-    if isinstance(precise, dt.datetime):
-        return precise
+    """정렬 기준 시각. 초 단위까지는 알 수 없어 같은 분에 몰린 거래끼리는
+    이 값만으로 순서가 정확하지 않을 수 있는데, 그건 _reorder_by_balance가
+    잔액을 근거로 바로잡는다."""
     t = row['시간'] or ''
     m = re.match(r'^(\d{1,2}):(\d{2})$', t)
     if m:
@@ -364,22 +360,37 @@ def _reset_sheet(wb, name):
     return wb.create_sheet(name)
 
 
+def _append_row(ws, row):
+    ws.append([row.get(h) for h in HEADERS])
+    r = ws.max_row
+    for idx in AMOUNT_COL_IDX:
+        ws.cell(row=r, column=idx).number_format = '#,##0'
+
+
 def write_all_sheet(wb, rows):
     ws = _reset_sheet(wb, '전체내역')
     ws.append(HEADERS)
     for row in sorted(rows, key=lambda r: (sort_key(r), r['은행'])):
-        ws.append([row.get(h) for h in HEADERS])
-    _format_amount_columns(ws, ['금액', '잔액'])
+        _append_row(ws, row)
 
 
 def write_bank_sheets(wb, rows):
     for bank in BANK_ORDER:
         ws = _reset_sheet(wb, bank)
-        ws.append(HEADERS)
         bank_rows = [r for r in rows if r['은행'] == bank]
-        for row in sorted(bank_rows, key=sort_key):
-            ws.append([row.get(h) for h in HEADERS])
-        _format_amount_columns(ws, ['금액', '잔액'])
+        deposits = sorted((r for r in bank_rows if r['구분'] == '입금'), key=sort_key)
+        withdrawals = sorted((r for r in bank_rows if r['구분'] == '출금'), key=sort_key)
+
+        ws.append(['입금 내역'])
+        ws.append(HEADERS)
+        for row in deposits:
+            _append_row(ws, row)
+
+        ws.append([])
+        ws.append(['출금 내역'])
+        ws.append(HEADERS)
+        for row in withdrawals:
+            _append_row(ws, row)
 
 
 def write_daily_summary(wb, rows):
