@@ -1,0 +1,4 @@
+openpyxl
+pyinstaller
+winocr
+Pillow
