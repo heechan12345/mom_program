@@ -1,4 +1,2 @@
 openpyxl
 pyinstaller
-winocr
-Pillow

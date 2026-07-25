@@ -1,54 +1,48 @@
 """가족 입출금 내역 정리 프로그램
 
-은행 문자 스크린샷(농협/우리은행/하나은행)을 OCR로 읽어 엑셀로 정리한다.
+'SMS Backup & Restore' 등으로 내보낸 문자 백업 XML 파일(농협/우리은행/하나은행
+입출금 문자 포함)을 읽어서, 지정한 연/월 범위의 거래만 골라 엑셀로 정리한다.
 """
 import os
 import re
-import sys
-import glob
+import json
 import datetime as dt
 import threading
 import traceback
+import xml.etree.ElementTree as ET
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 
-from PIL import Image
-import openpyxl
 from openpyxl import Workbook, load_workbook
-
-import winocr
-from winrt.windows.media.ocr import OcrEngine
-from winrt.windows.globalization import Language
 
 
 # ----------------------------------------------------------------------
 # 파싱 규칙
 #
-# 실제 카카오톡 캡처로 확인한 특징:
-#  - Windows OCR 결과는 줄바꿈 없이 공백으로 이어진 한 줄 텍스트로 나온다.
-#  - 숫자 "2,"가 종종 한글 "기" 한 글자로 잘못 인식된다 (예: "2,873,850"->"기873,850").
-#  - 시간의 콜론이 자주 사라지거나("15:34"->"1534"), 앞자리 숫자가 공백으로
-#    분리된다("18:09"->"1 8:09").
-#  - 화면에는 "확인된 발신번호", "거래내역 바로가기", "알림", 날짜 구분선
-#    같은 채팅 UI 문구도 함께 인식된다.
+# 문자 원문 예시 (아래는 형식 설명을 위한 가상의 예시 데이터임):
+#   우리 07/24 15:56 / *123456 / 입금 100,000원 / (주)예시상사 / 잔액 1,000,000원
+#   하나 07/24 18:09 / 111******22333 / 출금 50,000원 / 예시결제 / 잔액 2,000,000원
+#   농협 입금100,000원 / 07/23 11:15 111-****-2222-33 홍길동 잔액300,000원   (일반)
+#   농협04/22 20:24 111-****-2222-33 자동출금10,000원(적요) 잔액40,000원      (자동출금, 줄바꿈 없음)
 # ----------------------------------------------------------------------
 
 BANK_NAMES = {'우리': '우리은행', '하나': '하나은행', '농협': '농협'}
 BANK_ORDER = ['농협', '우리은행', '하나은행']
+KST = dt.timezone(dt.timedelta(hours=9))
 
 ACCOUNT_RE = re.compile(
     r'(?:\*\d{5,8}|\d{2,3}\*{3,8}\d{3,6}|\d{2,4}-\*{2,6}-\d{2,6}-\d{1,4})'
 )
 DATE_RE = re.compile(r'(\d{1,2})/(\d{1,2})')
 AMOUNT_TOKEN = r'(?:[\d,]|기)+'
-TXN_RE = re.compile(r'(입금|출금)\s*(' + AMOUNT_TOKEN + r')\s*원')
+# "자동출금"처럼 입금/출금 앞에 접두어가 붙는 경우도 있어 접두어까지 통째로 지운다.
+TXN_RE = re.compile(r'(?:자동)?(입금|출금)\s*(' + AMOUNT_TOKEN + r')\s*원')
 BALANCE_RE = re.compile(r'잔액\s*(' + AMOUNT_TOKEN + r')\s*원')
-YEAR_DIVIDER_RE = re.compile(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일')
 
 ANCHOR_RE = re.compile(
-    r'(?:(우리|하나)(?=\s*\d{1,2}/\d{1,2}))'
-    r'|(?:(농협)(?=\s*(?:입금|출금)\s*(?:[\d,]|기)+\s*원))'
+    r'(?P<bank>우리|하나|농협)(?=\s*\d{1,2}/\d{1,2})'
+    r'|(?P<bank2>농협)(?=\s*(?:입금|출금)\s*(?:[\d,]|기)+\s*원)'
 )
 
 TOKEN_BLOCKLIST_RE = re.compile(
@@ -57,18 +51,17 @@ TOKEN_BLOCKLIST_RE = re.compile(
 
 
 def normalize_amount(raw: str) -> int:
-    """OCR이 '2,'를 '기'로 잘못 읽는 현상을 보정하여 정수 금액으로 변환."""
+    """OCR이 '2,'를 '기'로 잘못 읽는 현상을 보정하여 정수 금액으로 변환.
+
+    (스크린샷 OCR 시절의 잔재지만 문자 원문에는 '기'가 나올 일이 없으므로
+    두어도 해가 없다.)
+    """
     fixed = raw.replace('기', '2,').replace(',', '')
     return int(fixed)
 
 
 def extract_time(block: str, start: int):
-    """날짜 매칭 바로 뒤 구간에서 시간을 찾는다. 못 찾으면 None.
-
-    OCR이 콜론 앞뒤 숫자 사이에 공백을 끼워 넣는 경우(예: "1 8:09",
-    "1 1 :1 5")가 흔해 각 숫자 사이 공백을 허용하는 패턴을 우선 시도하고,
-    콜론 자체가 사라진 경우("1534")를 마지막에 시도한다.
-    """
+    """날짜 매칭 바로 뒤 구간에서 시간을 찾는다. 못 찾으면 None."""
     window = block[start:start + 14]
     m = re.match(r'\s*(\d)\s*(\d)\s*[:•.]\s*(\d)\s*(\d)', window)
     if m:
@@ -90,37 +83,59 @@ def extract_description(remainder: str) -> str:
     return ''
 
 
-def find_year(full_text: str, pos: int, default_year: int) -> int:
-    best = None
-    for m in YEAR_DIVIDER_RE.finditer(full_text):
-        if m.start() <= pos:
-            best = int(m.group(1))
-        else:
-            break
-    return best or default_year
+def _find_text_field(node):
+    """RCS(리치카드) JSON 구조 안에서 실제 문자 내용이 담긴 'text' 값을 재귀적으로 찾는다."""
+    if isinstance(node, dict):
+        val = node.get('text')
+        if isinstance(val, str) and any(b in val for b in ('우리', '하나', '농협')):
+            return val
+        for v in node.values():
+            found = _find_text_field(v)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_text_field(item)
+            if found:
+                return found
+    return None
+
+
+def extract_body_text(raw_body: str) -> str:
+    """일반 SMS는 그대로, RCS 리치카드(JSON)는 안의 실제 문자 텍스트를 꺼낸다."""
+    stripped = raw_body.strip()
+    if not stripped.startswith('{'):
+        return raw_body
+    try:
+        data = json.loads(raw_body)
+    except (json.JSONDecodeError, ValueError):
+        return raw_body
+    found = _find_text_field(data)
+    return found if found else raw_body
 
 
 def split_messages(text: str):
-    """OCR 텍스트를 은행 토큰 기준 메시지 블록들로 분리한다."""
+    """텍스트를 은행 토큰 기준 메시지 블록들로 분리한다."""
     matches = list(ANCHOR_RE.finditer(text))
     blocks = []
     for i, m in enumerate(matches):
-        bank_token = m.group(1) or m.group(2)
+        bank_token = m.group('bank') or m.group('bank2')
         start = m.start()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         blocks.append((bank_token, start, text[start:end]))
     return blocks
 
 
-def parse_block(bank_token: str, block: str, block_start: int, full_text: str,
-                 default_year: int, source_file: str):
-    """블록 하나를 파싱한다. 성공 시 (record, None), 실패 시 (None, 사유)."""
+def extract_fields(bank_token: str, block: str):
+    """블록 하나에서 날짜(월/일)를 뺀 나머지 필드를 뽑는다.
+
+    성공 시 (dict, None), 실패 시 (None, 사유).
+    """
     bank = BANK_NAMES[bank_token]
 
     dm = DATE_RE.search(block)
     if not dm:
         return None, '날짜를 찾지 못함'
-    month, day = int(dm.group(1)), int(dm.group(2))
 
     txn = TXN_RE.search(block)
     if not txn:
@@ -140,13 +155,6 @@ def parse_block(bank_token: str, block: str, block_start: int, full_text: str,
     acct_m = ACCOUNT_RE.search(block)
     account = acct_m.group(0) if acct_m else ''
 
-    year = find_year(full_text, block_start, default_year)
-    try:
-        date_val = dt.date(year, month, day)
-    except ValueError:
-        return None, '날짜 값이 올바르지 않음'
-
-    # 적요 추출을 위해 이미 인식한 구간을 공백으로 지운다
     chars = list(block)
 
     def blank(span):
@@ -163,63 +171,96 @@ def parse_block(bank_token: str, block: str, block_start: int, full_text: str,
     remainder = ''.join(chars)
     desc = extract_description(remainder)
 
-    record = {
+    return {
         '은행': bank,
-        '날짜': date_val,
+        'month': int(dm.group(1)),
+        'day': int(dm.group(2)),
         '시간': time_str or '',
         '구분': txn.group(1),
         '금액': amount,
         '적요': desc,
         '잔액': balance,
         '계좌': account,
-        '확인필요': '',
-        '출처파일': source_file,
-        'OCR원문': block.strip(),
-    }
-    return record, None
+    }, None
 
 
-def parse_ocr_text(text: str, source_file: str, default_year: int):
-    """이미지 한 장의 OCR 텍스트에서 레코드/미인식 목록을 뽑아낸다."""
+def resolve_date(epoch_dt: dt.datetime, month: int, day: int) -> dt.date:
+    """문자 원문의 월/일과, 문자를 받은 시각(epoch)을 조합해 정확한 연도를 정한다.
+
+    (문자 자체에는 연도가 없고, 자정을 넘겨 배달되는 경우도 있어 받은 시각과
+    가장 가까운 연도를 고른다.)
+    """
+    candidates = []
+    for y in (epoch_dt.year - 1, epoch_dt.year, epoch_dt.year + 1):
+        try:
+            d = dt.date(y, month, day)
+        except ValueError:
+            continue
+        candidates.append((abs((d - epoch_dt.date()).days), d))
+    if not candidates:
+        return epoch_dt.date()
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def epoch_ms_to_kst(date_ms: str) -> dt.datetime:
+    return dt.datetime.fromtimestamp(int(date_ms) / 1000, tz=KST)
+
+
+def parse_xml_file(path: str, target_year: int, target_month: int):
+    """SMS 백업 XML 하나에서 지정한 연/월의 은행 거래만 뽑아낸다."""
+    source = os.path.basename(path)
     records = []
     unrecognized = []
-    for bank_token, start, block in split_messages(text):
-        record, reason = parse_block(bank_token, block, start, text, default_year, source_file)
-        if record is None:
-            unrecognized.append({
-                '은행': BANK_NAMES.get(bank_token, bank_token),
-                '사유': reason,
-                '출처파일': source_file,
-                'OCR원문': block.strip(),
-            })
-        else:
+
+    tree = ET.parse(path)
+    root = tree.getroot()
+
+    for sms in root.iter('sms'):
+        raw_body = sms.get('body') or ''
+        if not any(b in raw_body for b in ('우리', '하나', '농협')):
+            continue
+        body = extract_body_text(raw_body)
+        date_ms = sms.get('date')
+        if not date_ms:
+            continue
+        try:
+            epoch_dt = epoch_ms_to_kst(date_ms)
+        except (TypeError, ValueError, OSError):
+            continue
+
+        for bank_token, _, block in split_messages(body):
+            fields, reason = extract_fields(bank_token, block)
+            if fields is None:
+                unrecognized.append({
+                    '은행': BANK_NAMES.get(bank_token, bank_token),
+                    '사유': reason,
+                    '출처파일': source,
+                    '원문': block.strip(),
+                })
+                continue
+
+            date_val = resolve_date(epoch_dt, fields.pop('month'), fields.pop('day'))
+            if date_val.year != target_year or date_val.month != target_month:
+                continue
+
+            record = dict(fields)
+            record['날짜'] = date_val
+            record['확인필요'] = ''
+            record['출처파일'] = source
+            record['원문'] = block.strip()
+            record['정렬시각'] = epoch_dt.replace(tzinfo=None)
             records.append(record)
+
     return records, unrecognized
-
-
-# ----------------------------------------------------------------------
-# OCR
-# ----------------------------------------------------------------------
-
-def check_korean_ocr_available() -> bool:
-    try:
-        return bool(OcrEngine.is_language_supported(Language('ko')))
-    except Exception:
-        return False
-
-
-def run_ocr_on_image(path: str) -> str:
-    img = Image.open(path)
-    result = winocr.recognize_pil_sync(img, lang='ko')
-    return result.get('text', '')
 
 
 # ----------------------------------------------------------------------
 # 엑셀 저장
 # ----------------------------------------------------------------------
 
-HEADERS = ['은행', '날짜', '시간', '구분', '금액', '적요', '잔액', '계좌', '확인필요', '출처파일', 'OCR원문']
-UNRECOG_HEADERS = ['은행', '사유', '출처파일', 'OCR원문']
+HEADERS = ['은행', '날짜', '시간', '구분', '금액', '적요', '잔액', '계좌', '확인필요', '출처파일', '원문', '정렬시각']
+UNRECOG_HEADERS = ['은행', '사유', '출처파일', '원문']
 
 
 def get_excel_path() -> str:
@@ -230,6 +271,19 @@ def get_excel_path() -> str:
 
 def row_key(row: dict):
     return (row['은행'], row['날짜'], row['시간'], row['구분'], row['금액'], row['잔액'])
+
+
+def sort_key(row: dict):
+    """정렬 기준 시각. 문자 원문의 '시:분'은 같은 분에 여러 건이 몰리면 순서를
+    구분 못하므로, 문자를 받은 정확한 시각(정렬시각)이 있으면 그걸 우선 쓴다."""
+    precise = row.get('정렬시각')
+    if isinstance(precise, dt.datetime):
+        return precise
+    t = row['시간'] or ''
+    m = re.match(r'^(\d{1,2}):(\d{2})$', t)
+    if m:
+        return dt.datetime.combine(row['날짜'], dt.time(int(m.group(1)), int(m.group(2))))
+    return dt.datetime.combine(row['날짜'], dt.time(0, 0))
 
 
 def load_existing_rows(wb) -> list:
@@ -259,6 +313,32 @@ def load_existing_unrecognized(wb) -> list:
     return rows
 
 
+def _reorder_by_balance(group_rows: list) -> list:
+    """시각(분 단위, 혹은 지연 배달된 문자의 수신 시각)만으로는 거래 순서를
+    정확히 알 수 없는 경우가 있다. 잔액은 순서에 따라 유일하게 결정되므로,
+    '이전 잔액에서 이 거래를 빼거나 더하면 이 거래의 잔액이 나오는지'를
+    근거로 다음 거래를 찾아 순서를 재구성한다. 계좌 하나당 거래 건수가
+    많지 않아 전체를 훑어도 부담이 없다."""
+    remaining = sorted(group_rows, key=sort_key)
+    ordered = []
+    prev_balance = None
+    while remaining:
+        if prev_balance is None:
+            ordered.append(remaining.pop(0))
+            prev_balance = ordered[-1]['잔액']
+            continue
+        match_idx = None
+        for i, r in enumerate(remaining):
+            delta = r['금액'] if r['구분'] == '입금' else -r['금액']
+            if prev_balance + delta == r['잔액']:
+                match_idx = i
+                break
+        nxt = remaining.pop(match_idx if match_idx is not None else 0)
+        ordered.append(nxt)
+        prev_balance = nxt['잔액']
+    return ordered
+
+
 def apply_reconciliation(rows: list):
     groups = {}
     for row in rows:
@@ -266,9 +346,9 @@ def apply_reconciliation(rows: list):
         groups.setdefault(key, []).append(row)
 
     for key, group_rows in groups.items():
-        group_rows.sort(key=lambda r: (r['날짜'], r['시간'] or '99:99'))
+        ordered = _reorder_by_balance(group_rows)
         prev_balance = None
-        for row in group_rows:
+        for row in ordered:
             if prev_balance is None:
                 row['확인필요'] = ''
             else:
@@ -287,8 +367,8 @@ def _reset_sheet(wb, name):
 def write_all_sheet(wb, rows):
     ws = _reset_sheet(wb, '전체내역')
     ws.append(HEADERS)
-    for row in sorted(rows, key=lambda r: (r['날짜'], r['시간'] or '', r['은행'])):
-        ws.append([row[h] for h in HEADERS])
+    for row in sorted(rows, key=lambda r: (sort_key(r), r['은행'])):
+        ws.append([row.get(h) for h in HEADERS])
     _format_amount_columns(ws, ['금액', '잔액'])
 
 
@@ -297,8 +377,8 @@ def write_bank_sheets(wb, rows):
         ws = _reset_sheet(wb, bank)
         ws.append(HEADERS)
         bank_rows = [r for r in rows if r['은행'] == bank]
-        for row in sorted(bank_rows, key=lambda r: (r['날짜'], r['시간'] or '')):
-            ws.append([row[h] for h in HEADERS])
+        for row in sorted(bank_rows, key=sort_key):
+            ws.append([row.get(h) for h in HEADERS])
         _format_amount_columns(ws, ['금액', '잔액'])
 
 
@@ -413,17 +493,27 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title('가족 입출금 내역 정리')
-        root.geometry('560x420')
+        root.geometry('600x460')
 
         self.selected_files = []
+        today = dt.date.today()
 
-        tk.Label(root, text='농협 / 우리은행 / 하나은행 문자 스크린샷을 선택해서 처리하세요.',
-                 font=('맑은 고딕', 11)).pack(pady=(14, 4))
+        tk.Label(root, text='문자 백업 XML 파일(SMS Backup & Restore 등)을 선택하고,\n정리할 연/월을 입력해서 처리하세요.',
+                 font=('맑은 고딕', 11), justify='left').pack(pady=(14, 4))
+
+        period_frame = tk.Frame(root)
+        period_frame.pack(pady=4)
+        tk.Label(period_frame, text='연도:').grid(row=0, column=0, padx=4)
+        self.year_var = tk.StringVar(value=str(today.year))
+        tk.Entry(period_frame, textvariable=self.year_var, width=6).grid(row=0, column=1, padx=4)
+        tk.Label(period_frame, text='월:').grid(row=0, column=2, padx=4)
+        self.month_var = tk.StringVar(value=str(today.month))
+        tk.Entry(period_frame, textvariable=self.month_var, width=4).grid(row=0, column=3, padx=4)
 
         btn_frame = tk.Frame(root)
-        btn_frame.pack(pady=6)
+        btn_frame.pack(pady=8)
 
-        self.select_btn = tk.Button(btn_frame, text='이미지 선택', width=16,
+        self.select_btn = tk.Button(btn_frame, text='XML 파일 선택', width=16,
                                      command=self.on_select)
         self.select_btn.grid(row=0, column=0, padx=6)
 
@@ -435,19 +525,13 @@ class App:
                                    command=self.on_open_excel)
         self.open_btn.grid(row=0, column=2, padx=6)
 
-        self.selected_label = tk.Label(root, text='선택된 이미지: 0개')
+        self.selected_label = tk.Label(root, text='선택된 파일: 0개')
         self.selected_label.pack(pady=(4, 8))
 
-        self.log = scrolledtext.ScrolledText(root, height=16, width=68, state='disabled')
+        self.log = scrolledtext.ScrolledText(root, height=16, width=72, state='disabled')
         self.log.pack(padx=10, pady=6, fill='both', expand=True)
 
-        self.log_line('한국어 OCR 기능을 확인하는 중...')
-        if not check_korean_ocr_available():
-            self.log_line('[오류] 한국어 OCR 언어팩이 없습니다.')
-            self.log_line('Windows 설정 > 시간 및 언어 > 언어 및 지역 > "한국어" 옵션 > '
-                           '"광학 문자 인식" 기능을 추가한 뒤 다시 실행해주세요.')
-        else:
-            self.log_line('준비 완료. "이미지 선택" 버튼을 눌러 시작하세요.')
+        self.log_line('"XML 파일 선택" 버튼을 눌러 시작하세요.')
 
     def log_line(self, text):
         self.log.configure(state='normal')
@@ -457,15 +541,15 @@ class App:
 
     def on_select(self):
         files = filedialog.askopenfilenames(
-            title='은행 문자 스크린샷 선택',
-            filetypes=[('이미지 파일', '*.jpg *.jpeg *.png *.bmp'), ('모든 파일', '*.*')],
+            title='문자 백업 XML 파일 선택',
+            filetypes=[('XML 파일', '*.xml'), ('모든 파일', '*.*')],
         )
         if not files:
             return
         self.selected_files = list(files)
-        self.selected_label.config(text=f'선택된 이미지: {len(self.selected_files)}개')
+        self.selected_label.config(text=f'선택된 파일: {len(self.selected_files)}개')
         self.process_btn.config(state='normal')
-        self.log_line(f'{len(self.selected_files)}개 이미지를 선택했습니다.')
+        self.log_line(f'{len(self.selected_files)}개 파일을 선택했습니다.')
 
     def on_open_excel(self):
         path = get_excel_path()
@@ -477,30 +561,37 @@ class App:
     def on_process(self):
         if not self.selected_files:
             return
+        try:
+            year = int(self.year_var.get())
+            month = int(self.month_var.get())
+            if not (1 <= month <= 12):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror('오류', '연도/월을 올바르게 입력해주세요. (예: 2026 / 7)')
+            return
+
         self.select_btn.config(state='disabled')
         self.process_btn.config(state='disabled')
-        self.log_line('처리를 시작합니다...')
-        thread = threading.Thread(target=self._process_worker, daemon=True)
+        self.log_line(f'{year}년 {month}월 내역을 처리합니다...')
+        thread = threading.Thread(target=self._process_worker, args=(year, month), daemon=True)
         thread.start()
 
-    def _process_worker(self):
+    def _process_worker(self, year, month):
         try:
             files = self.selected_files
-            default_year = dt.date.today().year
             all_records = []
             all_unrecognized = []
             for path in files:
                 name = os.path.basename(path)
                 try:
-                    text = run_ocr_on_image(path)
+                    records, unrecognized = parse_xml_file(path, year, month)
                 except Exception as e:
-                    self.root.after(0, self.log_line, f'[{name}] OCR 실패: {e}')
+                    self.root.after(0, self.log_line, f'[{name}] 읽기 실패: {e}')
                     continue
-                records, unrecognized = parse_ocr_text(text, name, default_year)
                 all_records.extend(records)
                 all_unrecognized.extend(unrecognized)
                 self.root.after(0, self.log_line,
-                                 f'[{name}] 인식 {len(records)}건, 미인식 {len(unrecognized)}건')
+                                 f'[{name}] {year}년 {month}월 거래 {len(records)}건, 미인식 {len(unrecognized)}건')
 
             added, review_count, path = save_all(all_records, all_unrecognized)
             self.root.after(0, self._on_done, added, review_count, len(all_unrecognized))
